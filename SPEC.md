@@ -1,588 +1,530 @@
-# Music Site — Project Specification
+# JDTunes - SPECS.md
 
-## Decisions & Assumptions
+## 1. Project Overview
 
-These resolve ambiguities upfront so every milestone has a clear target.
+**JDTunes** is a music web app for showcasing and streaming original music.
 
-| Decision | Resolution |
-|---|---|
-| **App architecture** | Single Page App (SPA) built with **Vite + vanilla JS modules**. One `index.html` entry point. Client-side routing via the History API so the `<audio>` element persists across view changes and music never interrupts. Production build via `npm run build` outputs to `dist/`. |
-| **Anonymous vs authenticated UX** | Anon users can browse albums, play tracks, and see global average ratings. Only authenticated users can rate tracks. A login prompt appears on rating interactions for anon users. |
-| **Signup flow** | The `/login` view handles both login and signup via a toggle. Email/password only. No email confirmation required for dev; enable confirm-on-signup before production deploy. |
-| **Rating scale** | 1–5 stars. A rating of 0 is not stored — it means "no rating." To clear a rating, delete the row from `track_ratings`. The DB constraint stays `between 0 and 5` as a safety net, but the UI never writes 0. |
-| **Play count trigger** | A play is counted once per track per play instance. When a track starts, set `hasCounted = false`. On `timeupdate`, if `!hasCounted && currentTime >= 5 && !audio.seeking`, call `incrementPlayCount(trackId)` and set `hasCounted = true`. Replaying the same track counts again. |
-| **Shuffle algorithm** | Fisher-Yates on the full track list at queue creation time. No-repeat-until-exhausted. Reshuffle when the queue loops. |
-| **`library.json` sync direction** | One-way: `library.json` → Supabase. Never edit track metadata directly in Supabase. A `scripts/seed.js` script handles upsert (insert or update on conflict). Run it any time `library.json` changes. |
-| **Rating stats** | Global stats come from RPC `get_track_rating_stats()` (primary). An optional view with `security_invoker` is only a fallback if your Postgres supports it; do not rely on it for the app. |
-| **Supabase config** | **App:** URL and anon key in `src/config.js` (gitignored), `src/config.example.js` committed. **Seed script:** reads `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` from environment (e.g. `.env` via `dotenv`). This keeps app config and server/seed config separate so Cursor does not mix them. |
-| **Error handling** | Every Supabase call is wrapped in a try/catch. Errors are logged to console and shown to the user via a toast/snackbar component in `ui.js`. Network failures during playback do not interrupt audio. |
-| **Audio range requests** | Nginx config must include `accept_ranges` and correct MIME types for `.mp3`. Verify with `curl -I` on deploy. |
+The app allows visitors to browse bands, albums, and tracks, then play either full albums or individual tracks through a persistent music player that remains available across the app.
 
----
+The app also includes an admin area where the site owner can manage music content and artwork.
 
-## File & Folder Blueprint
+This project should be built with a **simple MVP-first mindset**:
+- mobile-first
+- lightweight
+- fast to use
+- easy to host on a VPS
+- easy to expand later
 
-```
-music-site/
-├── index.html                    ← single entry point (Vite injects src/main.js)
-├── vite.config.js
-├── package.json
-├── data/
-│   └── library.json
-├── scripts/
-│   └── seed.js                   ← Node script: reads library.json, upserts into Supabase
-├── src/
-│   ├── config.js                 ← gitignored (Supabase URL + anon key)
-│   ├── config.example.js         ← committed with placeholders
-│   ├── main.js                   ← app entry: inits router, auth listener, player bar
-│   ├── router.js                 ← History API router, mounts/unmounts views
-│   ├── supabaseClient.js         ← initialises and exports the Supabase client
-│   ├── auth.js                   ← login, signup, logout, session listener
-│   ├── library.js                ← fetches and parses data/library.json
-│   ├── supabaseApi.js            ← all DB queries: tracks, ratings, play counts
-│   ├── player.js                 ← audio engine, queue, transport controls
-│   ├── ratings.js                ← star component, read/write user + global ratings
-│   ├── radio.js                  ← builds queues for All Songs / Top Rated modes
-│   ├── views/
-│   │   ├── homeView.js           ← albums grid + radio links (route: /)
-│   │   ├── albumView.js          ← album tracklist (route: /album/:id)
-│   │   ├── radioView.js          ← radio queue display (route: /radio/:mode)
-│   │   └── loginView.js          ← login/signup form (route: /login)
-│   ├── ui.js                     ← shared DOM helpers: toast, nav state, auth prompt
-│   └── styles.css
-├── nginx/
-│   └── music-site.conf           ← Nginx server block config for deploy
-└── .gitignore
-```
+Preferred stack:
+- **Frontend:** Vite + React
+- **Backend:** Node.js + Express
+- **Database:** PostgreSQL
+- **Storage:** audio files and images stored on the server filesystem
 
 ---
 
-## Data Shapes
+## 2. Core Goals
 
-### `library.json`
+### User goals
+- Browse available music by band and album
+- View album and track artwork
+- Play a full album in order
+- Play individual tracks
+- Keep the music player visible and usable while navigating between pages
+- Have a clean experience on mobile, tablet, and desktop
 
-```json
-{
-  "albums": [
-    {
-      "id": "alb_ebonstatic_01",
-      "title": "Versions of Silence",
-      "artist": "Ebon Static",
-      "year": 2026,
-      "cover": "/media/versions-of-silence/cover.jpg"
-    }
-  ],
-  "tracks": [
-    {
-      "id": "trk_vos_01",
-      "albumId": "alb_ebonstatic_01",
-      "title": "Persona Zero",
-      "trackNumber": 1,
-      "durationSeconds": 240,
-      "audio": "/media/versions-of-silence/01-persona-zero.mp3"
-    }
-  ]
-}
-```
-
-Note: `durationSeconds` is optional in the JSON — if omitted, the seed script should leave the DB column null and the player can read duration from the `<audio>` element's `loadedmetadata` event.
-
-### Supabase Tables
-
-**`tracks`** — seeded from `library.json`, never written to by the app.
-
-| Column | Type | Notes |
-|---|---|---|
-| id | text PK | Stable ID from library.json, e.g. `trk_vos_01` |
-| album_id | text | FK-like reference, not enforced (no albums table) |
-| title | text | |
-| audio_path | text | Relative path served by Nginx |
-| cover_path | text nullable | Inherited from album cover in seed script |
-| track_number | int | |
-| duration_seconds | int nullable | |
-| is_published | boolean default true | |
-| created_at | timestamptz | |
-
-**`track_ratings`** — user ratings, composite PK.
-
-| Column | Type | Notes |
-|---|---|---|
-| track_id | text FK → tracks | |
-| user_id | uuid FK → auth.users | |
-| rating | int CHECK 0–5 | App only writes 1–5; 0 is a DB safety net |
-| updated_at | timestamptz | |
-
-**`track_play_counts`** — incremented via RPC only.
-
-| Column | Type | Notes |
-|---|---|---|
-| track_id | text PK FK → tracks | |
-| play_count | bigint default 0 | |
-| updated_at | timestamptz | |
-
-### Source of truth (Cursor guardrail)
-
-- **`library.json` is the UI truth:** albums, tracks, paths, ordering. Album and track listing in the app comes from `library.getAlbum()`, `library.getAlbumTracks(albumId)`, etc.
-- **Supabase `tracks`** mirrors library.json for: `is_published`, joins for rating stats and play counts, and building radio queues (with published filter). Do not build album/track listing UI from Supabase; use library.json. Use `fetchTracks()` / Supabase only for metrics, filtering by published, or radio queue assembly.
+### Admin goals
+- Upload tracks
+- Add band names
+- Edit band names
+- Delete band names
+- Add album titles
+- Edit album titles
+- Delete album titles
+- Upload album art
+- Upload track art
+- Upload band art
+- Manage which tracks belong to which album and band
 
 ---
 
-## Module Exports (contract for each file)
+## 3. MVP Scope
 
-```
-config.js
-  export const SUPABASE_URL
-  export const SUPABASE_ANON_KEY
+### Included in MVP
+- Public music browsing UI
+- Public band pages
+- Public album pages
+- Track listing UI
+- Persistent audio player across all views/pages
+- Admin login
+- Admin dashboard
+- CRUD for bands
+- CRUD for albums
+- CRUD for tracks
+- Upload and display of:
+  - band art
+  - album art
+  - track art
+  - audio files
 
-main.js
-  // App entry point — no exports, runs on load:
-  // 1. Init router
-  // 2. Init auth listener (update nav on auth change)
-  // 3. Mount persistent player bar into #player-bar
-  // 4. Load library.json once and cache in memory
-
-router.js
-  export function navigateTo(path)         // pushState + render
-  export function initRouter()             // listen to popstate, do initial render
-  // Routes:
-  //   /              → homeView
-  //   /album/:id     → albumView
-  //   /radio/:mode   → radioView (mode = "all" | "top")
-  //   /login         → loginView
-  // The router mounts views into a #app container div.
-  // The <audio> element and player bar live OUTSIDE #app so they persist.
-
-supabaseClient.js
-  export const supabase          // initialised client instance
-
-auth.js
-  export async function signUp(email, password)
-  export async function signIn(email, password)
-  export async function signOut()
-  export function onAuthChange(callback)   // wraps onAuthStateChange
-  export function getUser()                // returns current user or null
-
-library.js
-  export async function loadLibrary()      // returns { albums, tracks }
-  export function getAlbum(albumId)
-  export function getAlbumTracks(albumId)
-
-supabaseApi.js
-  export async function fetchTracks()                    // all published (for radio queue / filtering)
-  export async function fetchTrackRatingStats()          // calls supabase.rpc('get_track_rating_stats')
-  export async function fetchUserRatings(userId)         // all of a user's ratings
-  export async function upsertRating(trackId, rating)    // 1–5
-  export async function deleteRating(trackId)            // clear rating
-  export async function incrementPlayCount(trackId)      // calls RPC
-
-player.js
-  export function playTrack(track)
-  export function playQueue(queue, startIndex)
-  export function next()
-  export function prev()
-  export function toggle()                  // play/pause
-  export function seek(seconds)
-  export function getState()                // { track, queue, index, playing, currentTime, duration }
-  export function onStateChange(callback)   // fires on play, pause, track change, time update
-
-ratings.js
-  export function renderStars(container, trackId)   // mounts star widget
-  export function refreshStars(trackId)             // re-fetch and re-render
-
-radio.js
-  export async function buildAllSongsQueue()        // Fisher-Yates shuffled
-  export async function buildTopRatedQueue()        // sorted by avg desc, filtered
-
-views/homeView.js
-  export function render(container)         // albums grid + radio links
-
-views/albumView.js
-  export function render(container, albumId)  // album tracklist + play all button
-
-views/radioView.js
-  export function render(container, mode)   // queue list + auto-play
-
-views/loginView.js
-  export function render(container)         // login/signup form
-
-ui.js
-  export function showToast(message, type)          // type: 'info' | 'error'
-  export function updateNavAuth(user)               // show/hide login link
-  export function promptLogin()                     // navigateTo('/login') or modal
-```
+### Not included in MVP
+- User accounts for listeners
+- Likes, ratings, comments, or favorites
+- Playlists created by users
+- Search with advanced filtering
+- Social features
+- Payments or subscriptions
+- Analytics beyond very basic optional play counts
+- Multi-admin roles and permissions
 
 ---
 
-## SQL (run in Supabase SQL editor)
+## 4. User Roles
 
-Copy-paste this entire block. It is idempotent.
+### Public user
+Can:
+- view bands
+- view albums
+- view tracks
+- play albums
+- play individual tracks
+- use persistent player
 
-```sql
--- ============================================================
--- TABLES
--- ============================================================
-
-create table if not exists tracks (
-  id text primary key,
-  album_id text not null,
-  title text not null,
-  audio_path text not null,
-  cover_path text,
-  track_number int,
-  duration_seconds int,
-  is_published boolean not null default true,
-  created_at timestamptz not null default now()
-);
-
-create table if not exists track_ratings (
-  track_id text not null references tracks(id) on delete cascade,
-  user_id uuid not null references auth.users(id) on delete cascade,
-  rating int not null check (rating between 0 and 5),
-  updated_at timestamptz not null default now(),
-  primary key (track_id, user_id)
-);
-
-create table if not exists track_play_counts (
-  track_id text primary key references tracks(id) on delete cascade,
-  play_count bigint not null default 0,
-  updated_at timestamptz not null default now()
-);
-
--- ============================================================
--- RPC: increment play count (security definer — bypasses RLS)
--- ============================================================
-
-create or replace function increment_track_play(p_track_id text)
-returns void
-language plpgsql
-security definer
-as $$
-begin
-  insert into track_play_counts(track_id, play_count, updated_at)
-  values (p_track_id, 1, now())
-  on conflict (track_id)
-  do update set play_count = track_play_counts.play_count + 1,
-                updated_at = now();
-end;
-$$;
-
--- ============================================================
--- RPC: rating stats (aggregates only, safe for anon)
--- ============================================================
-
-create or replace function get_track_rating_stats()
-returns table (
-  track_id text,
-  avg_rating numeric(10,2),
-  rating_count int
-)
-language sql
-security definer
-as $$
-  select
-    t.id as track_id,
-    coalesce(avg(r.rating), 0)::numeric(10,2) as avg_rating,
-    count(r.rating)::int as rating_count
-  from tracks t
-  left join track_ratings r on r.track_id = t.id
-  where t.is_published = true
-  group by t.id;
-$$;
-
--- Optional fallback: if your Postgres/Supabase supports security_invoker
--- you can instead use a view; the app uses the RPC above as primary.
-
--- ============================================================
--- RLS
--- ============================================================
-
-alter table tracks enable row level security;
-alter table track_ratings enable row level security;
-alter table track_play_counts enable row level security;
-
--- tracks: anyone can read published
-create policy "tracks are readable"
-  on tracks for select
-  to anon, authenticated
-  using (is_published = true);
-
--- ratings: users manage their own; they can read only their own (no raw rows for anon)
-create policy "users can read own ratings"
-  on track_ratings for select
-  to authenticated
-  using (auth.uid() = user_id);
-
-create policy "users can insert own ratings"
-  on track_ratings for insert
-  to authenticated
-  with check (auth.uid() = user_id);
-
-create policy "users can update own ratings"
-  on track_ratings for update
-  to authenticated
-  using (auth.uid() = user_id);
-
-create policy "users can delete own ratings"
-  on track_ratings for delete
-  to authenticated
-  using (auth.uid() = user_id);
-
--- play counts: readable by all, writable only via RPC
-create policy "play counts readable"
-  on track_play_counts for select
-  to anon, authenticated
-  using (true);
-
-create policy "no direct inserts"
-  on track_play_counts for insert
-  to anon, authenticated
-  with check (false);
-
-create policy "no direct updates"
-  on track_play_counts for update
-  to anon, authenticated
-  using (false);
-```
-
-**Ratings privacy:** Anon cannot read `track_ratings`. Authenticated users can read only their own rows. Global averages come from the RPC `get_track_rating_stats()` (aggregates only). Do not add policies that let anon or all users read raw ratings.
+### Admin
+Can:
+- log in securely
+- create, edit, delete bands
+- create, edit, delete albums
+- create, edit, delete tracks
+- upload images and audio
+- assign tracks to albums and bands
+- change display order if implemented in MVP or phase 2
 
 ---
 
-## Milestones
+## 5. Functional Requirements
 
-Work through these in order. Complete exit criteria before moving on.
+## 5.1 Public App
 
----
+### Home page
+Should show:
+- featured bands, albums, or latest releases
+- a simple clean layout
+- quick access to music
+- responsive design
 
-### M0 — Project Setup (Vite)
+### Band page
+Should show:
+- band name
+- band art
+- list of albums for that band
+- optional list of standalone tracks if needed later
 
-**Do:**
-1. Scaffold the project: `npm create vite@latest music-site -- --template vanilla` then restructure to match the blueprint above.
-2. Add `"type": "module"` to `package.json` so both Vite and `scripts/seed.js` use ESM (avoids Cursor mixing CJS/ESM).
-3. Install dependencies: `npm install @supabase/supabase-js` and for seed: `npm install dotenv`
-3. Create `src/config.example.js` with placeholders.
-4. Add `.gitignore` (include `src/config.js`, `.env`, `node_modules/`, `dist/`).
-5. Set up `index.html` with the persistent DOM skeleton:
+### Album page
+Should show:
+- album title
+- band name
+- album art
+- track list
+- play album button
+- ability to play individual tracks
 
-```html
-<body>
-  <nav id="main-nav"><!-- filled by main.js --></nav>
-  <div id="app"><!-- views mount here --></div>
-  <div id="player-bar"><!-- persistent player, filled by player.js --></div>
-  <audio id="audio-el"></audio>
-</body>
-```
+### Track item
+Should show:
+- track title
+- band name
+- album title if applicable
+- duration if available
+- track art if available
+- play button
 
-6. `src/main.js` — import styles, log "app loaded" to console.
-7. Run `npm run dev` — verify Vite dev server starts and `index.html` loads with no errors.
+### Persistent music player
+Must:
+- remain visible at the bottom of the screen across all public pages/views
+- continue playback while navigating between pages
+- show current track info
+- provide play/pause
+- provide next/previous track when playing an album or queue
+- show progress bar / seek bar
+- support volume control on desktop
+- remain usable and clean on mobile
 
-**Exit criteria:** `npm run dev` serves the app, `index.html` renders with the skeleton markup, console shows no errors, ES module imports work.
-
----
-
-### M1 — Supabase Setup
-
-**Do:**
-1. Create Supabase project.
-2. Enable Email/Password auth (disable email confirmation for dev).
-3. Run the full SQL block above in the SQL editor.
-4. Copy your project URL and anon key into `src/config.js`.
-
-**Exit criteria:** Tables exist, RLS is enabled, RPCs `increment_track_play` and `get_track_rating_stats` exist. Verify by running `select * from tracks` in the SQL editor (should return empty, no errors).
-
----
-
-### M2 — Library Manifest + Seed Script
-
-**Do:**
-1. Populate `data/library.json` with your real albums and tracks.
-2. Create `scripts/seed.js` — a Node script that:
-   - Loads env with `dotenv` (e.g. `import 'dotenv/config'` or load from `.env`) and reads `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` (or a dedicated seed key). Do not import `src/config.js` from the seed script.
-   - Reads `library.json`
-   - For each track, upserts into Supabase `tracks` table (insert on conflict update)
-   - Inherits `cover_path` from the album's `cover` field
-   - Uses the Supabase JS client (`@supabase/supabase-js`) with the service role key from env
-3. Run the seed: `node scripts/seed.js` (with `.env` present, not committed).
-
-**Exit criteria:** Every track in `library.json` exists in the `tracks` table. Running seed twice does not create duplicates.
+### Playback behavior
+- User can click **Play Album** to queue all tracks from that album in order
+- User can click an individual track to play just that track, or begin playback from that point in album context
+- When one track ends, next track should start automatically if part of an album queue
+- Player state should be maintained across route changes
 
 ---
 
-### M3 — SPA Router + View Skeleton
+## 5.2 Admin App
 
-**Do:**
-1. `src/router.js` — implement a lightweight History API router:
-   - Define route patterns: `/`, `/album/:id`, `/radio/:mode`, `/login`
-   - `initRouter()` — listen to `popstate`, parse `window.location.pathname`, call the matching view's `render()` function with `document.getElementById('app')` as the container.
-   - `navigateTo(path)` — `history.pushState`, then trigger the same render logic.
-   - On no match, render a simple 404 message.
-2. Create all four view files in `src/views/` with placeholder content:
-   - `homeView.js` — "Home — albums go here" + links to `/album/alb_ebonstatic_01` and `/radio/all`.
-   - `albumView.js` — reads `:id` param, shows "Album: {id}".
-   - `radioView.js` — reads `:mode` param, shows "Radio: {mode}".
-   - `loginView.js` — "Login form goes here".
-3. `src/main.js` — import and call `initRouter()`, build nav with links that call `navigateTo()` (intercept `<a>` clicks to prevent full page reloads).
-4. Shared nav on every page: Home, Login/Logout link.
+### Admin authentication
+Must include:
+- secure login form
+- protected admin routes
+- session or token-based auth
+- logout
 
-**Routing architecture:**
-- `#app` is the only DOM node that changes on navigation.
-- `#player-bar`, `#main-nav`, and `<audio>` live outside `#app` and are never destroyed.
-- Each view's `render(container, ...params)` function clears the container and builds its DOM. No framework, just `innerHTML` or `createElement`.
-- All internal links use `<a href="/path" data-link>`. **Link interception rules:** only intercept clicks on elements with `data-link`. Do **not** intercept if: `e.metaKey || e.ctrlKey || e.shiftKey || e.altKey`; or `e.button !== 0` (not left click); or `target="_blank"`; or `href` starts with `http` (external). Otherwise call `e.preventDefault()` and `navigateTo(href)`.
+### Admin dashboard
+Should provide clear access to:
+- band management
+- album management
+- track management
+- file uploads
 
-**Exit criteria:** All four routes render their placeholder content. Clicking nav links changes the URL and view without a full page reload. Browser back/forward works. The `<audio>` element in `#player-bar` remains in the DOM across all navigations (verify via DevTools).
+### Band management
+Admin can:
+- add band
+- edit band name
+- delete band
+- upload or replace band art
 
----
+### Album management
+Admin can:
+- add album
+- edit album title
+- delete album
+- assign album to band
+- upload or replace album art
 
-### M4 — Supabase Client + Auth
+### Track management
+Admin can:
+- add track
+- edit track title
+- delete track
+- assign track to album
+- assign track to band
+- upload audio file
+- upload or replace track art
+- set track order within album
+- set duration automatically if practical, or store manually if needed
 
-**Do:**
-1. `supabaseClient.js` — import `createClient` from `@supabase/supabase-js` (installed via npm, bundled by Vite), initialise with config values, export client.
-2. `auth.js` — implement `signUp`, `signIn`, `signOut`, `onAuthChange`, `getUser`.
-3. `views/loginView.js` — wire up form with toggle between Login and Sign Up modes. On successful login, `navigateTo('/')`.
-4. `main.js` — on app init, call `onAuthChange` to update nav (show username + Logout link, or Login link).
+### File upload requirements
+Admin should be able to upload:
+- audio files, initially MP3 minimum
+- image files for band art, album art, and track art
 
-**Exit criteria:** User can sign up, log in, see their email in nav, log out. Session persists on page refresh (Supabase stores tokens in localStorage). Navigating between views does not lose auth state.
-
----
-
-### M5 — Player Engine
-
-**Do:**
-1. `player.js` — grab the existing `<audio id="audio-el">` element (created in `index.html`, persists across views), manage queue + index + state.
-2. Expose all functions per the module contract above.
-3. Build the sticky player bar inside `#player-bar`:
-   - Track title + album art thumbnail
-   - Play/pause, prev, next buttons
-   - Progress bar (clickable to seek)
-   - Current time / duration display
-4. Player bar updates via `onStateChange`.
-5. Player bar is built once in `main.js` on app init — it is never destroyed by route changes.
-
-**Play count hook:** `onStateChange` fires an event that M6 will listen to. For now, just ensure `onStateChange` provides `currentTime`.
-
-**Exit criteria:** Click a track on the album page → it plays. Click album "Play All" → queue loads, next/prev cycle through tracks. Navigate to a different view mid-playback → audio continues uninterrupted and player bar remains visible. Player bar reflects current state on all views.
-
----
-
-### M6 — Play Counts
-
-**Do:**
-1. In `player.js`, add play count logic (simple crossing check, no seek heuristic):
-   - When a new track starts (or the same track replays), set `hasCounted = false`.
-   - On `timeupdate`: if `!hasCounted && audio.currentTime >= 5 && !audio.seeking`, then call `incrementPlayCount(trackId)` and set `hasCounted = true`.
-2. Since this is an SPA, the `<audio>` element persists and `hasCounted` lives in module scope — no need for `Set` or nonce tracking across page loads.
-
-**Exit criteria:** Play a track for >5 seconds → `track_play_counts` row increments by 1 in Supabase. Replaying the same track increments again. Seeking to 0:06 does not count. Navigating views mid-track does not double-count or lose the count state.
+Uploads should:
+- validate file types
+- validate max file size
+- store safe filenames or generated unique filenames
+- save file path references in the database
 
 ---
 
-### M7 — Ratings UI
+## 6. UX / UI Requirements
 
-**Do:**
-1. `ratings.js` — render a 5-star widget.
-   - Always show global average (filled stars proportional to avg, e.g. 3.5 = 3.5 filled).
-   - If logged in, show the user's own rating as highlighted stars on hover/click.
-   - Click a star → `upsertRating(trackId, n)`.
-   - Click the same star again → `deleteRating(trackId)` (toggle off).
-   - If not logged in, click → `promptLogin()`.
-2. `supabaseApi.js` — implement `fetchTrackRatingStats`, `fetchUserRatings`, `upsertRating`, `deleteRating`.
-3. Show star widget on album page (per track) and in the player bar.
+The app should feel similar in spirit to **Suno** in terms of ease of use and persistent playback, but simpler.
 
-**Exit criteria:** Logged-in user can rate a track 1–5, see their rating persist on refresh, clear it. Global average updates reflect all users' ratings (test with two accounts).
+### Design priorities
+- mobile-first layout
+- clean and modern UI
+- minimal friction to start music playback
+- clear visual hierarchy
+- strong artwork presentation
+- bottom player always accessible
 
----
+### Responsive requirements
 
-### M8 — Radio Modes
+#### Mobile
+- stacked layout
+- bottom player optimized for touch
+- artwork and controls sized for phone screens
+- menus simplified
 
-**Do:**
-1. `radio.js`:
-   - `buildAllSongsQueue()` — fetch all published tracks, Fisher-Yates shuffle, return as queue.
-   - `buildTopRatedQueue()` — fetch `track_rating_stats` joined with `tracks`, filter `rating_count >= 3`, sort by `avg_rating` desc then `rating_count` desc, return as queue.
-2. `views/radioView.js`:
-   - Read `:mode` param from the router (`"all"` or `"top"`).
-   - Build the appropriate queue.
-   - Auto-play the first track.
-   - Display the queue as a scrollable list, highlight current track.
-   - If Top Rated has no qualifying tracks, show a message: "Not enough rated tracks yet. Rate some songs to build this playlist!"
+#### Tablet
+- more breathing room in layout
+- better use of horizontal space
+- persistent player still docked at bottom
 
-**Exit criteria:** All Songs Radio plays shuffled tracks with no repeats until exhausted. Top Rated Radio plays correctly filtered and sorted tracks. Queue displays correctly and advances. Navigating away and back to radio does not restart the queue if music is still playing.
-
----
-
-### M9 — VPS Deploy
-
-**Do:**
-1. Build the app: `npm run build` — outputs to `dist/`.
-2. Upload to VPS:
-   - `dist/` → `/var/www/music-site/dist/` (the built app)
-   - `data/` → `/var/www/music-site/data/` (library.json, fetched at runtime)
-   - Media files → `/var/www/music-site/media/` (MP3s + cover art, NOT inside dist)
-3. Configure Nginx:
-
-```nginx
-server {
-    listen 80;
-    server_name yourdomain.com;
-
-    root /var/www/music-site/dist;
-    index index.html;
-
-    # SPA fallback — all routes serve index.html, client router handles the rest
-    location / {
-        try_files $uri /index.html;
-    }
-
-    # library.json served from outside dist
-    location /data/ {
-        alias /var/www/music-site/data/;
-    }
-
-    # Audio + cover art served from outside dist
-    location /media/ {
-        alias /var/www/music-site/media/;
-        types {
-            audio/mpeg mp3;
-            image/jpeg jpg jpeg;
-            image/png png;
-        }
-        add_header Accept-Ranges bytes;
-    }
-}
-```
-
-4. Verify audio range requests: `curl -I -H "Range: bytes=0-1023" https://yourdomain.com/media/some-track.mp3` — should return `206 Partial Content`.
-5. Enable HTTPS via certbot / Let's Encrypt.
-6. Add your domain to Supabase Auth → URL Configuration → Site URL and Redirect URLs.
-
-**Why media lives outside `dist/`:** Vite's build only bundles source code. MP3s and cover art are large binary files managed separately on the VPS filesystem. `library.json` is also outside `dist/` so you can update it without rebuilding.
-
-**Exit criteria:** Site loads over HTTPS, client-side routing works (deep links like `/album/alb_ebonstatic_01` resolve correctly via Nginx fallback), auth works, audio streams with seeking, play counts and ratings function.
+#### Desktop
+- richer multi-column layouts where useful
+- more visible metadata and artwork
+- room for extra player controls like volume and queue
 
 ---
 
-## Cursor Workflow
+## 7. Suggested Information Architecture
 
-1. **Commit `SPEC.md` to the repo root.** Tell Cursor to reference it.
-2. **One milestone per session.** Prompt format: "Implement M4 per SPEC.md. Files to create: `supabaseClient.js`, `auth.js`. Exit criteria: user can sign in/out, UI shows logged-in state."
-3. **Test before proceeding.** Open browser, verify exit criteria, then start the next milestone.
-4. **If Cursor drifts,** paste the relevant module export contract and say "only implement these exports, nothing else."
-5. **Keep `library.json` updated** and re-run `seed.js` whenever you add tracks.
+### Public routes
+- `/` - home
+- `/bands` - optional band list page
+- `/bands/:bandId` - band page
+- `/albums/:albumId` - album page
+- `/tracks/:trackId` - optional track detail page if needed
 
-### Cursor guardrails (paste into prompts when needed)
-
-- Do not add frameworks (stay Vite + vanilla JS).
-- Do not modify SQL policies unless explicitly instructed.
-- Respect module exports exactly as listed; do not add or remove exports.
-- Do not create additional pages — only the views listed in the spec.
+### Admin routes
+- `/admin/login`
+- `/admin`
+- `/admin/bands`
+- `/admin/albums`
+- `/admin/tracks`
+- `/admin/uploads` - optional if separated
 
 ---
 
-## Future Considerations (out of scope, but worth noting)
+## 8. Data Model - MVP
 
-- **Album ratings / comments:** Could extend the rating system to album-level.
-- **Admin panel:** A simple authenticated page to toggle `is_published` without touching the DB directly.
-- **Playlist support:** User-created playlists beyond the two radio modes.
-- **Progressive Web App:** Add a manifest and service worker for offline-capable playback.
-- **View transitions:** Add CSS transitions or a lightweight animation when swapping views for a smoother feel.
-- **Keyboard shortcuts:** Space for play/pause, arrow keys for next/prev — ergonomic for a music app.
+## 8.1 Bands
+Fields:
+- id
+- name
+- slug
+- art_path
+- created_at
+- updated_at
+
+## 8.2 Albums
+Fields:
+- id
+- band_id
+- title
+- slug
+- art_path
+- release_date (optional)
+- created_at
+- updated_at
+
+## 8.3 Tracks
+Fields:
+- id
+- band_id
+- album_id
+- title
+- slug
+- audio_path
+- art_path
+- duration_seconds
+- track_number
+- created_at
+- updated_at
+
+### Relationships
+- one band has many albums
+- one band has many tracks
+- one album belongs to one band
+- one album has many tracks
+- one track belongs to one band
+- one track may belong to one album
+
+---
+
+## 9. Backend Requirements
+
+### API responsibilities
+Backend should handle:
+- auth for admin
+- CRUD for bands
+- CRUD for albums
+- CRUD for tracks
+- file upload handling
+- serving uploaded images
+- streaming audio files
+
+### Audio streaming
+Audio playback should support:
+- HTTP range requests
+- seeking within tracks
+- stable streaming from local server storage
+
+This is important so playback works properly in browser audio players.
+
+### Validation
+Backend should validate:
+- required fields
+- valid entity relationships
+- file types
+- file sizes
+- safe deletion behavior
+
+### Deletion behavior
+Need defined rules:
+- deleting a band should either:
+  - block delete if albums/tracks exist, or
+  - cascade delete carefully
+- deleting an album should define what happens to its tracks
+- deleting a track should remove or preserve files depending on chosen implementation
+
+For MVP, prefer **safe blocking or explicit confirmation logic** rather than automatic destructive cascade.
+
+---
+
+## 10. Frontend Requirements
+
+### State management
+Frontend should manage:
+- current playing track
+- current queue / album queue
+- playback state
+- player visibility
+- current progress
+
+The player should ideally use:
+- React context, Zustand, or similarly simple global state
+
+### Key frontend behaviors
+- route changes must not stop music
+- player remains mounted globally
+- loading states should be clear
+- empty states should be handled gracefully
+- artwork fallback should exist when no image is uploaded
+
+---
+
+## 11. Suggested API Endpoints
+
+## Auth
+- `POST /api/admin/login`
+- `POST /api/admin/logout`
+- `GET /api/admin/me`
+
+## Bands
+- `GET /api/bands`
+- `GET /api/bands/:id`
+- `POST /api/bands`
+- `PUT /api/bands/:id`
+- `DELETE /api/bands/:id`
+
+## Albums
+- `GET /api/albums`
+- `GET /api/albums/:id`
+- `POST /api/albums`
+- `PUT /api/albums/:id`
+- `DELETE /api/albums/:id`
+
+## Tracks
+- `GET /api/tracks`
+- `GET /api/tracks/:id`
+- `POST /api/tracks`
+- `PUT /api/tracks/:id`
+- `DELETE /api/tracks/:id`
+
+## Uploads / Media
+- `POST /api/uploads/band-art`
+- `POST /api/uploads/album-art`
+- `POST /api/uploads/track-art`
+- `POST /api/uploads/audio`
+
+## Streaming
+- `GET /media/audio/:filename`
+- `GET /media/images/:filename`
+
+---
+
+## 12. Storage Strategy
+
+### Database stores
+- metadata
+- relationships
+- filenames / paths
+- ordering data
+
+### Filesystem stores
+- audio files
+- image files
+
+Suggested folder structure on server:
+- `/uploads/bands`
+- `/uploads/albums`
+- `/uploads/tracks`
+- `/uploads/audio`
+
+---
+
+## 13. Security Requirements
+
+- admin routes must be protected
+- passwords must be hashed securely
+- uploaded filenames must be sanitized or replaced
+- file upload limits must be enforced
+- only allowed MIME/file types accepted
+- server should not expose unrestricted filesystem access
+- auth cookies or tokens should be handled securely
+
+---
+
+## 14. Error Handling Requirements
+
+Public app should handle:
+- missing artwork
+- empty albums
+- missing tracks
+- failed playback
+- slow loading
+
+Admin app should handle:
+- upload failures
+- validation errors
+- delete failures
+- invalid login attempts
+
+Responses should be clear and useful, not vague.
+
+---
+
+## 15. Non-Functional Requirements
+
+- app should be lightweight enough for VPS hosting
+- should load quickly on mobile connections
+- should be easy to deploy and maintain
+- should avoid unnecessary complexity
+- should be structured so future features can be added cleanly
+
+---
+
+## 16. Phase 2 Ideas
+
+Possible later additions:
+- drag-and-drop track ordering
+- featured albums section
+- search
+- listener accounts
+- likes / favorites
+- playlists
+- play counts
+- genre tags
+- release year filters
+- analytics dashboard
+- multiple admin users
+
+---
+
+## 17. Open Decisions
+
+These should be decided early:
+1. Will tracks always belong to an album, or can tracks exist independently?
+2. Should deleting a band/album be blocked when child records exist?
+3. Should uploaded files be deleted from disk when records are deleted?
+4. Will admin upload track duration manually or should backend detect it?
+5. Will there be one band only at first, or should full multi-band support remain in MVP?
+6. Should the player support a queue beyond single album playback in MVP?
+
+---
+
+## 18. Implementation Guidance for AI Coding Tools
+
+When generating code for this project:
+- build MVP first
+- keep components small and focused
+- prefer simple and maintainable patterns
+- avoid over-engineering
+- use clear folder structure
+- separate public app and admin concerns cleanly
+- ensure persistent player architecture is decided early
+- implement audio streaming correctly with range request support
+- make responsive design a core requirement, not an afterthought
+
+---
+
+## 19. MVP Summary
+
+JDTunes MVP is a responsive music streaming web app with:
+- public browsing of bands, albums, and tracks
+- a persistent bottom music player across all pages
+- album playback and individual track playback
+- admin tools for managing bands, albums, tracks, artwork, and audio uploads
+- local server file storage and lightweight VPS-friendly architecture
+
+The first version should focus on doing these core features well before adding advanced features.
+
